@@ -14,6 +14,8 @@ import { VRFV2PlusClient } from "@chainlink/contracts/src/v0.8/vrf/dev/libraries
 /// the VRFHandler without modifying your main contract's logic. Contracts interact with this handler
 /// via the IVRFHandlerReceiver interface, ensuring compatibility with future VRF upgrades.
 contract VRFHandler is IVRFHandler, VRFConsumerBaseV2Plus {
+  string internal constant EXECUTION_KEY_DOMAIN = "chainlink-vrf-service-execution-v1";
+
   /*─────────────────────────────────────────────────────────────────────────────────────
   │ Types
   └─────────────────────────────────────────────────────────────────────────────────────*/
@@ -61,6 +63,12 @@ contract VRFHandler is IVRFHandler, VRFConsumerBaseV2Plus {
   /// @dev VRF Request ID => Commitment data
   mapping(uint256 requestId => Commitment commitment) public commitments;
 
+  /// @dev Domain-separated execution key => immutable request inputs and terminal state
+  mapping(bytes32 executionKey => Execution execution) internal executions;
+
+  /// @dev VRF Request ID => domain-separated execution key
+  mapping(uint256 requestId => bytes32 executionKey) public vrfRequestIdToExecutionKey;
+
   /*─────────────────────────────────────────────────────────────────────────────────────
   │ Errors
   └─────────────────────────────────────────────────────────────────────────────────────*/
@@ -73,6 +81,18 @@ contract VRFHandler is IVRFHandler, VRFConsumerBaseV2Plus {
 
   /// @dev Emitted when a parameter provided is invalid
   error InvalidParameter();
+
+  /// @dev Emitted when an execution identity has already consumed its only request
+  error ExecutionAlreadyRegistered(bytes32 executionKey);
+
+  /// @dev Emitted when an execution does not exist
+  error ExecutionNotFound(bytes32 executionKey);
+
+  /// @dev Emitted when a terminal operation targets an execution that is no longer pending
+  error ExecutionNotPending(bytes32 executionKey, ExecutionStatus status);
+
+  /// @dev Emitted when expiration is attempted before the registered terminal time
+  error ExecutionNotExpired(bytes32 executionKey, uint64 terminalAt);
 
   /*─────────────────────────────────────────────────────────────────────────────────────
   │ Events
@@ -112,6 +132,34 @@ contract VRFHandler is IVRFHandler, VRFConsumerBaseV2Plus {
 
   /// @dev Emitted when a callback to the requester fails — fulfillment still succeeds
   event CallbackFailed(uint256 indexed requestId, address indexed requester, bytes reason);
+
+  /// @dev Emitted when one globally unique immutable execution requests randomness
+  event ExecutionRequested(
+    bytes32 indexed executionKey,
+    uint256 indexed requestId,
+    address indexed requester,
+    bytes32 executionId,
+    bytes32 commitmentHash,
+    uint32 randomWordsAmount,
+    uint64 terminalAt,
+    uint32 finalityBlocks
+  );
+
+  /// @dev Emitted when an execution accepts coordinator fulfillment before its terminal time
+  event ExecutionFulfilled(
+    bytes32 indexed executionKey, uint256 indexed requestId, bytes32 indexed commitmentHash, bytes32 randomWordsHash
+  );
+
+  /// @dev Emitted when a requester permanently cancels its pending execution
+  event ExecutionCancelled(bytes32 indexed executionKey, uint256 indexed requestId, address indexed requester);
+
+  /// @dev Emitted when a pending execution reaches its terminal time without accepted fulfillment
+  event ExecutionExpired(bytes32 indexed executionKey, uint256 indexed requestId);
+
+  /// @dev Emitted when coordinator fulfillment arrives for a cancelled or expired execution
+  event ExecutionFulfillmentIgnored(
+    bytes32 indexed executionKey, uint256 indexed requestId, ExecutionStatus indexed status
+  );
 
   /*─────────────────────────────────────────────────────────────────────────────────────
   │ Constructor
@@ -255,6 +303,100 @@ contract VRFHandler is IVRFHandler, VRFConsumerBaseV2Plus {
     emit CommitmentStored(requestId, manifestHash, rangeSize, randomWordsAmount);
   }
 
+  /// @inheritdoc IVRFHandler
+  function requestRandomWordsForExecution(
+    bytes32 executionId,
+    bytes32 commitmentHash,
+    uint32 randomWordsAmount,
+    uint64 terminalAt,
+    uint32 finalityBlocks
+  )
+    external
+    returns (uint256 requestId, bytes32 executionKey)
+  {
+    if (!allowedRequesters[msg.sender]) revert Unauthorized();
+    if (
+      executionId == bytes32(0) || commitmentHash == bytes32(0) || randomWordsAmount == 0 || finalityBlocks == 0
+        || uint256(terminalAt) <= block.timestamp
+    ) revert InvalidParameter();
+
+    executionKey = computeExecutionKey(executionId);
+    Execution storage execution = executions[executionKey];
+    if (execution.status != ExecutionStatus.None) revert ExecutionAlreadyRegistered(executionKey);
+
+    execution.executionId = executionId;
+    execution.commitmentHash = commitmentHash;
+    execution.requestedAtBlock = block.number;
+    execution.requester = msg.sender;
+    execution.requestedAt = uint64(block.timestamp);
+    execution.terminalAt = terminalAt;
+    execution.randomWordsAmount = randomWordsAmount;
+    execution.finalityBlocks = finalityBlocks;
+    execution.status = ExecutionStatus.Requested;
+
+    unchecked {
+      activeRequests++;
+    }
+
+    requestId = _createVRFRequest(randomWordsAmount);
+    if (requestId == 0) revert InvalidVrfState();
+
+    execution.requestId = requestId;
+    vrfRequestIdToRequester[requestId] = msg.sender;
+    vrfRequestIdToExecutionKey[requestId] = executionKey;
+
+    emit RandomWordsRequested(requestId, msg.sender, randomWordsAmount);
+    emit ExecutionRequested(
+      executionKey, requestId, msg.sender, executionId, commitmentHash, randomWordsAmount, terminalAt, finalityBlocks
+    );
+  }
+
+  /// @inheritdoc IVRFHandler
+  function computeExecutionKey(bytes32 executionId) public view returns (bytes32 executionKey) {
+    executionKey =
+      keccak256(abi.encodePacked(EXECUTION_KEY_DOMAIN, bytes1(0), block.chainid, address(this), executionId));
+  }
+
+  /// @inheritdoc IVRFHandler
+  function cancelExecution(bytes32 executionId) external {
+    bytes32 executionKey = computeExecutionKey(executionId);
+    Execution storage execution = executions[executionKey];
+    if (execution.status == ExecutionStatus.None) revert ExecutionNotFound(executionKey);
+    if (execution.requester != msg.sender) revert Unauthorized();
+    if (execution.status != ExecutionStatus.Requested) revert ExecutionNotPending(executionKey, execution.status);
+
+    execution.status = ExecutionStatus.Cancelled;
+    emit ExecutionCancelled(executionKey, execution.requestId, msg.sender);
+  }
+
+  /// @inheritdoc IVRFHandler
+  function expireExecution(bytes32 executionKey) external {
+    Execution storage execution = executions[executionKey];
+    if (execution.status == ExecutionStatus.None) revert ExecutionNotFound(executionKey);
+    if (execution.status != ExecutionStatus.Requested) revert ExecutionNotPending(executionKey, execution.status);
+    if (block.timestamp < uint256(execution.terminalAt)) {
+      revert ExecutionNotExpired(executionKey, execution.terminalAt);
+    }
+
+    execution.status = ExecutionStatus.Expired;
+    emit ExecutionExpired(executionKey, execution.requestId);
+  }
+
+  /// @inheritdoc IVRFHandler
+  function isExecutionUsable(bytes32 executionKey) external view returns (bool usable) {
+    Execution storage execution = executions[executionKey];
+    if (execution.status != ExecutionStatus.Fulfilled) return false;
+
+    uint256 finalityBlocks = uint256(execution.finalityBlocks);
+    usable = block.number >= execution.requestedAtBlock + finalityBlocks
+      && block.number >= execution.fulfilledAtBlock + finalityBlocks;
+  }
+
+  /// @inheritdoc IVRFHandler
+  function getExecution(bytes32 executionKey) external view returns (Execution memory execution) {
+    execution = executions[executionKey];
+  }
+
   /*─────────────────────────────────────────────────────────────────────────────────────
   │ Internal functions
   └─────────────────────────────────────────────────────────────────────────────────────*/
@@ -331,6 +473,8 @@ contract VRFHandler is IVRFHandler, VRFConsumerBaseV2Plus {
       emit RandomWordsFulfilledWithCommitment(_requestId, commitment.manifestHash, _randomWords, results);
     }
 
+    _resolveExecutionFulfillment(_requestId, _randomWords);
+
     // Only make external call if a callback selector was specified
     // Requests made via requestRandomWordsNoCallback have selector = bytes4(0)
     if (selector != bytes4(0)) {
@@ -342,6 +486,32 @@ contract VRFHandler is IVRFHandler, VRFConsumerBaseV2Plus {
       (bool success, bytes memory reason) = requester.call(callData);
       if (!success) emit CallbackFailed(_requestId, requester, reason);
     }
+  }
+
+  /// @dev Accepts execution fulfillment only before its terminal time; cancellation and expiry never free the key
+  function _resolveExecutionFulfillment(uint256 requestId, uint256[] calldata randomWords) internal {
+    bytes32 executionKey = vrfRequestIdToExecutionKey[requestId];
+    Execution storage execution = executions[executionKey];
+
+    // A zero mapping value is valid in theory, so request identity—not the key value—distinguishes legacy requests.
+    if (execution.requestId != requestId || execution.status == ExecutionStatus.None) return;
+
+    if (execution.status == ExecutionStatus.Requested && block.timestamp >= uint256(execution.terminalAt)) {
+      execution.status = ExecutionStatus.Expired;
+      emit ExecutionExpired(executionKey, requestId);
+    }
+
+    if (execution.status != ExecutionStatus.Requested) {
+      emit ExecutionFulfillmentIgnored(executionKey, requestId, execution.status);
+      return;
+    }
+
+    bytes32 randomWordsHash = keccak256(abi.encode(randomWords));
+    execution.randomWordsHash = randomWordsHash;
+    execution.fulfilledAtBlock = block.number;
+    execution.status = ExecutionStatus.Fulfilled;
+
+    emit ExecutionFulfilled(executionKey, requestId, execution.commitmentHash, randomWordsHash);
   }
 
   /*─────────────────────────────────────────────────────────────────────────────────────
